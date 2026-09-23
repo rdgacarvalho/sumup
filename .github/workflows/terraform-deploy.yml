@@ -1,0 +1,225 @@
+name: Terraform Deploy
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  AWS_REGION: eu-west-1
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  checks:
+    name: Format, validate and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+
+      - name: Format
+        run: |
+          ./ci/terraform.sh fmt
+
+  ministack:
+    name: Validate and deploy on Ministack Cloud Emulator
+    needs: checks
+    runs-on: ubuntu-latest
+    services:
+      ministack:
+        image: ministackorg/ministack
+        env:
+          MINISTACK_REGION: eu-west-1
+          MINISTACK_ACCOUNT_ID: "123456789012"
+        ports:
+          - 4566:4566
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+
+      - name: Ministack
+        run: |
+          ./ci/terraform.sh test
+          ./ci/terraform.sh validate 
+          ./ci/terraform.sh plan
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          TF_VAR_emulator_endpoint: http://ministack:4566
+
+  infracost:
+    name: Infracost cost estimate and management
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    services:
+      ministack:
+        image: ministackorg/ministack
+        env:
+          MINISTACK_REGION: eu-west-1
+          MINISTACK_ACCOUNT_ID: "123456789012"
+        ports:
+          - 4566:4566
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+
+      - name: Plan on Ministack
+        run: ./ci/terraform.sh plan
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          TF_VAR_emulator_endpoint: http://ministack:4566
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Infracost breakdown
+        continue-on-error: true
+        run: ./ci/infracost.sh
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Post Infracost comment
+        run: ./ci/infracost.sh comment github "${{ github.repository }}" "${{ github.event.pull_request.number }}" "${{ github.token }}"
+        continue-on-error: true
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+  # Selection: the S3 backend is workspace-aware (env:/<name> state key, per-state
+  # lockfile), so ci/terraform.sh runs in BATCH mode: it seeds missing workspaces
+  # from var.teams (onboarding) then iterates terraform workspace list --json with
+  # CI_PARALLELISM=10. No 256-job matrix cap, no registry file.
+  deploy-plan:
+    name: Plan on AWS (all workspaces)
+    if: github.event_name == 'push'
+    needs: [checks, ministack]
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_emulator_endpoint: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+
+      - name: Plan
+        run: ./ci/terraform.sh plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+
+      - name: Infracost cost report
+        run: ./ci/infracost.sh
+        continue-on-error: true
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+  # Gate: the aws-apply environment must be configured with required reviewers
+  # (Settings > Environments). Until approved, this job stays "waiting for
+  # approval" and nothing touches real AWS. Apply re-plans and applies the plan
+  # file in the same job, so the approved plan is the plan that runs.
+  deploy-apply:
+    name: Apply on AWS (approval required)
+    if: github.event_name == 'push'
+    needs: [checks, ministack, deploy-plan]
+    runs-on: ubuntu-latest
+    environment: aws-apply
+    env:
+      TF_VAR_emulator_endpoint: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+
+      - name: Plan
+        run: ./ci/terraform.sh plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+
+      - name: Apply
+        run: ./ci/terraform.sh apply
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+
+  notify-started:
+    name: Notify Slack - started
+    if: github.event_name == 'push'
+    needs: [checks, ministack]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack - started
+        run: |
+          BODY="{\"text\":\"Terraform deploy started on ${{ github.ref_name }} (${GITHUB_SHA:0:7}) by ${{ github.actor }}.\"}"
+          curl -sS -X POST -H 'Content-type: application/json' -d "$BODY" "${{ secrets.SLACK_WEBHOOK }}"
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        continue-on-error: true
+
+  notify-merged:
+    name: Notify Slack - merged
+    if: success() && github.event_name == 'push'
+    needs: [deploy-apply]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack - merged
+        run: |
+          BODY="{\"text\":\":rocket: Changes merged to *${{ github.ref_name }}* were planned on AWS, approved and applied. Build ${GITHUB_SHA:0:7} by ${{ github.actor }}.\"}"
+          curl -sS -X POST -H 'Content-type: application/json' -d "$BODY" "${{ secrets.SLACK_WEBHOOK }}"
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+  slack-failure:
+    name: Notify Slack on failure #Validated on my own workspace
+    if: failure() && github.event_name == 'push'
+    needs: [checks, ministack, deploy-plan, deploy-apply]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack - failed
+        run: |
+          BODY="{\"text\":\":x: Terraform deploy failed on ${{ github.ref_name }} (${GITHUB_SHA:0:7}). See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+          curl -sS -X POST -H 'Content-type: application/json' -d "$BODY" "${{ secrets.SLACK_WEBHOOK }}"
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
