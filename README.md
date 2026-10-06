@@ -4,7 +4,7 @@
 
 Terraform modules and a workspace-based root module for the SumUp Cloud Infrastructure take-home.
 
-The root `main.tf` maps `terraform.workspace` to an entry in `var.teams` and passes that team's buckets and IAM trust policy into `modules/s3` and `modules/iam`. Each team uses a Terraform workspace so state is isolated.
+The root `main.tf` maps `terraform.workspace` to an entry in `var.teams` and passes that team's buckets and IAM trust policy into `modules/s3` and `modules/iam`. Each team uses a Terraform workspace so state is **fully** isolated from each other.
 
 ## Tech Stack
 
